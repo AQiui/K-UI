@@ -101,7 +101,7 @@ async function realtimeAdminHeader(env) {
 async function notifyRealtimePublicPolicy(env, db, enabled, pagesOrigin = '') {
     const authorization = await realtimeAdminHeader(env);
     if (!authorization) return;
-    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    const configured = env.REALTIME_URL || (await readSysConfig(db, 'realtime_url'))?.val;
     if (!configured || !/^https:\/\//i.test(configured)) return;
     await fetch(`${configured.replace(/\/$/, '')}/public-policy`, {
         method: 'POST',
@@ -121,7 +121,7 @@ function realtimeFrequencyPolicy(settings = {}) {
 async function notifyRealtimeFrequencyPolicy(env, db, settings, pagesOrigin = '') {
     const policy = realtimeFrequencyPolicy(settings);
     const authorization = await realtimeAdminHeader(env);
-    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    const configured = env.REALTIME_URL || (await readSysConfig(db, 'realtime_url'))?.val;
     if (!policy || !authorization || !configured || !/^https:\/\//i.test(configured)) return;
     await fetch(`${configured.replace(/\/$/, '')}/frequency-policy`, {
         method: 'POST',
@@ -132,7 +132,7 @@ async function notifyRealtimeFrequencyPolicy(env, db, settings, pagesOrigin = ''
 
 async function notifyRealtimeVps(env, db, ip, pagesOrigin = '') {
     const authorization = await realtimeAdminHeader(env);
-    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    const configured = env.REALTIME_URL || (await readSysConfig(db, 'realtime_url'))?.val;
     if (!authorization || !configured || !/^https:\/\//i.test(configured)) return;
     await fetch(`${configured.replace(/\/$/, '')}/notify`, { method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json', 'X-KUI-Pages-Origin': pagesOrigin }, body: JSON.stringify({ ip }) });
 }
@@ -467,6 +467,89 @@ async function parseThirdPartySubscription(content) {
 
 let schemaReadyPromise = null;
 let lastReceiptCleanup = 0;
+let lastStatsCleanup = 0;
+
+// ============================================================
+// D1 用量治理层（rows read 优化）
+// 免费额度仅 500 万行读/天，按「扫描行数」计费。以下工具用于：
+//   1) 高频只读查询走 isolate 级 TTL 缓存
+//   2) 额度耗尽时熔断降级，避免持续 500 + 客户端重试雪崩
+// ============================================================
+const D1_READ_CACHE = new Map();
+const D1_CACHE_MAX = 2000;
+let d1QuotaBlockedUntil = 0;
+
+function isD1QuotaError(error) {
+    const message = String((error && error.message) || error || '');
+    return /exceeded|daily row read|rows read limit|row write limit|storage limit/i.test(message);
+}
+
+/** 命中 D1 限额时打开熔断，冷却期内不再发起非必要查询 */
+function openD1Breaker(error) {
+    d1QuotaBlockedUntil = Date.now() + 10 * 60 * 1000;
+    console.error('[D1] 已超出当日额度，进入 10 分钟降级模式:', String((error && error.message) || error).slice(0, 160));
+}
+
+function d1BreakerOpen() { return Date.now() < d1QuotaBlockedUntil; }
+
+/**
+ * isolate 级 TTL 缓存读取。
+ * - 单飞去重：并发同 key 只打一次 D1
+ * - 负缓存：空结果也缓存，防止伪造 ip / 未知 key 反复穿透
+ * - 陈旧兜底：D1 报错或超额时返回上一份旧值，保证可用性
+ */
+async function cachedRead(key, ttlMs, producer, options = {}) {
+    const now = Date.now();
+    const cached = D1_READ_CACHE.get(key);
+    if (cached && cached.exp > now) return cached.value;
+
+    const pending = cached && cached.pending;
+    if (pending) return pending;
+
+    const promise = (async () => {
+        try {
+            const value = await producer();
+            const empty = value == null || (Array.isArray(value) && value.length === 0);
+            const ttl = empty && options.negativeTtlMs ? options.negativeTtlMs : ttlMs;
+            D1_READ_CACHE.set(key, { value, exp: Date.now() + ttl });
+            if (D1_READ_CACHE.size > D1_CACHE_MAX) {
+                const iterator = D1_READ_CACHE.keys();
+                for (let i = 0; i < 200; i++) { const k = iterator.next().value; if (k === undefined) break; D1_READ_CACHE.delete(k); }
+            }
+            return value;
+        } catch (error) {
+            if (isD1QuotaError(error)) openD1Breaker(error);
+            if (options.staleIfError !== false && cached && cached.value !== undefined) return cached.value;
+            throw error;
+        } finally {
+            const entry = D1_READ_CACHE.get(key);
+            if (entry && entry.pending) entry.pending = null;
+        }
+    })();
+
+    if (cached) cached.pending = promise; else D1_READ_CACHE.set(key, { value: undefined, exp: 0, pending: promise });
+    return promise;
+}
+
+function invalidateReadCache(prefix) {
+    for (const key of D1_READ_CACHE.keys()) if (key.startsWith(prefix)) D1_READ_CACHE.delete(key);
+}
+
+/** sys_config 单键读取（PK 查询，1 行，但调用极频繁，统一缓存 60s） */
+function readSysConfig(db, key, ttlMs = 60000) {
+    return cachedRead(`sys_config:${key}`, ttlMs, async () => {
+        const row = await db.prepare("SELECT val, ts FROM sys_config WHERE key = ?").bind(key).first();
+        return row || null;
+    }, { negativeTtlMs: 15000 });
+}
+
+/** probe_settings 单键读取（PK 查询，缓存 60s） */
+function readProbeSetting(db, key, ttlMs = 60000) {
+    return cachedRead(`probe_setting:${key}`, ttlMs, async () => {
+        const row = await db.prepare("SELECT value FROM probe_settings WHERE key = ?").bind(key).first();
+        return row ? row.value : null;
+    }, { negativeTtlMs: 15000 });
+}
 
 function loginThrottleKey(request) { return `${request.headers.get('CF-Connecting-IP') || 'unknown'}:${String(request.headers.get('Authorization') || '').split('.')[0].slice(0, 128)}`; }
 
@@ -483,6 +566,10 @@ async function recordLoginFailure(db, request) {
     const blockedUntil = failures >= 8 ? now + 15 * 60 * 1000 : 0;
     await db.prepare('INSERT INTO login_throttles (key, failures, window_started_at, blocked_until) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET failures = excluded.failures, window_started_at = excluded.window_started_at, blocked_until = excluded.blocked_until').bind(key, failures, freshWindow ? now : row.window_started_at, blockedUntil).run();
 }
+
+// 迁移版本号：提升到新值时才会执行下面的重活（ALTER 探测 / 全表 UPDATE）。
+// 这样每个新 isolate 只需 1 次版本查询 + 少量 DDL，不再重复跑 50+ 条语句。
+const SCHEMA_VERSION = 2;
 
 async function initializeDbSchema(db) {
     const initQueries = [
@@ -501,6 +588,30 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
+
+    // ---- D1 rows read 优化：补全缺失索引 ----
+    // 没有这些索引时，每次 agent 上报 / 拉取配置都会对 nodes 全表扫描，
+    // 每天轻松烧掉几百万行读取额度（免费额度仅 500 万行/天）。
+    const indexQueries = [
+        `CREATE INDEX IF NOT EXISTS idx_nodes_vps_ip ON nodes(vps_ip)`,          // /api/config + 流量上报的 WHERE 条件
+        `CREATE INDEX IF NOT EXISTS idx_nodes_username ON nodes(username)`,        // 删除用户时批量转交节点
+        `CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON report_receipts(created_at)`, // 过期回执清理
+        `CREATE INDEX IF NOT EXISTS idx_traffic_stats_ts ON traffic_stats(timestamp)`,       // 历史流量清理
+        `CREATE INDEX IF NOT EXISTS idx_servers_last_report ON servers(last_report, alert_sent)`, // 离线巡检
+        `CREATE INDEX IF NOT EXISTS idx_proxy_ctrl_last_seen ON proxy_ctrl_servers(last_seen)`   // 代理池在线筛选
+    ];
+    for (let query of indexQueries) { try { await db.prepare(query).run(); } catch (e) {} }
+
+    // ---- 迁移版本守卫：已完成的重活不再重复执行 ----
+    let currentVersion = 0;
+    try {
+        const versionRow = await db.prepare("SELECT val FROM sys_config WHERE key = 'schema_version'").first();
+        currentVersion = parseInt(versionRow && versionRow.val, 10) || 0;
+    } catch (e) {}
+    if (currentVersion >= SCHEMA_VERSION) return;
+
+    const markSchemaVersion = () => db.prepare("INSERT INTO sys_config (key, val, ts) VALUES ('schema_version', ?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val, ts = excluded.ts").bind(String(SCHEMA_VERSION), Date.now()).run().catch(() => {});
+
     try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
     try { await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
@@ -521,6 +632,8 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS proxy_servers (ip TEXT PRIMARY KEY, socks_ip TEXT, port INTEGER, user TEXT, pass TEXT, country TEXT DEFAULT '', enabled INTEGER DEFAULT 1, last_seen INTEGER)`
     ];
     for (let query of probeQueries) { try { await db.prepare(query).run(); } catch (e) {} }
+    // probe_servers / proxy_servers 由上面这组语句建表，索引必须放在其后
+    for (let query of [`CREATE INDEX IF NOT EXISTS idx_probe_servers_hidden ON probe_servers(is_hidden)`]) { try { await db.prepare(query).run(); } catch (e) {} }
 
     try { await db.prepare("SELECT username FROM nodes LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE nodes ADD COLUMN username TEXT DEFAULT 'admin'").run(); } catch(e){} }
     try { await db.prepare("SELECT disk FROM servers LIMIT 1").first(); } catch (e) { const newCols = ['disk INTEGER DEFAULT 0', 'load TEXT DEFAULT ""', 'uptime TEXT DEFAULT ""', 'net_in_speed INTEGER DEFAULT 0', 'net_out_speed INTEGER DEFAULT 0', 'tcp_conn INTEGER DEFAULT 0', 'udp_conn INTEGER DEFAULT 0']; for (let col of newCols) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${col}`).run(); } catch(err){} } }
@@ -572,12 +685,21 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS third_party_nodes (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, name TEXT, protocol TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, uuid TEXT, password TEXT, sni TEXT, public_key TEXT, short_id TEXT, flow TEXT, network TEXT, host TEXT, path TEXT, extra TEXT, enable INTEGER DEFAULT 1, created_at INTEGER, FOREIGN KEY(subscription_id) REFERENCES third_party_subscriptions(id) ON DELETE CASCADE)`
     ];
     for (let query of tpsQueries) { try { await db.prepare(query).run(); } catch (e) {} }
+
+    // 迁移全部完成后写入版本号：之后的新 isolate 只跑 DDL + 索引，跳过上面所有重活
+    try { await markSchemaVersion(); } catch (e) {}
 }
 
 async function ensureDbSchema(db) {
     if (!schemaReadyPromise) {
         schemaReadyPromise = initializeDbSchema(db).catch(error => {
             schemaReadyPromise = null;
+            // 额度耗尽时不要让整个请求 500（会让 agent 反复重试形成雪崩），
+            // 表结构通常已存在，直接放行让后续查询走各自的降级分支。
+            if (isD1QuotaError(error)) {
+                openD1Breaker(error);
+                return true;
+            }
             throw error;
         });
     }
@@ -622,10 +744,14 @@ async function verifyAuth(authHeader, request, db, env, context) {
 
 async function verifyAgent(authHeader, ip, db, env) {
     if (!authHeader) return false;
-    if (ip) {
-        const server = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
-        if (server && server.agent_token && authHeader === server.agent_token) return true;
-    }
+    if (!ip) return false;
+    // agent_token 极少变动，缓存 5 分钟：省掉每次请求的往返，
+    // 并让额度耗尽期间仍能命中缓存继续鉴权（否则 agent 会 401 并疯狂重试）
+    const server = await cachedRead(`agent_token:${ip}`, 300000, async () => {
+        const row = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
+        return row || null;
+    }, { negativeTtlMs: 30000, staleIfError: true });
+    if (server && server.agent_token && authHeader === server.agent_token) return true;
     return false;
 }
 
@@ -712,7 +838,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
         const servers = (await db.prepare('SELECT p.id, p.name, p.cpu, p.ram, p.disk, p.load_avg, p.uptime, p.last_updated, p.net_in_speed, p.net_out_speed, p.os, p.arch, p.virt, p.tcp_conn, p.udp_conn, p.country, p.ip_v4, p.ip_v6, p.server_group, p.price, p.expire_date, p.bandwidth, p.traffic_limit, p.ping_ct, p.ping_cu, p.ping_cm, p.ping_bd, p.monthly_rx, p.monthly_tx, p.net_rx, p.net_tx, p.cpu_info, p.ram_used, p.ram_total, p.disk_used, p.disk_total FROM probe_servers p INNER JOIN servers s ON s.ip = p.id WHERE p.is_hidden != "true"').all()).results;
         const publicKeys = new Set(['theme', 'is_public', 'site_title', 'show_price', 'show_expire', 'show_bw', 'show_tf', 'custom_css', 'custom_bg', 'custom_head', 'custom_script', 'report_interval', 'enable_popup', 'popup_content', 'cached_nodes_data', 'auto_reset_traffic', 'visits_total', 'visits_today', 'visits_date']);
         for (const key of Object.keys(settings)) if (!publicKeys.has(key)) delete settings[key];
-        const realtime = env.REALTIME_URL ? null : await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
+        const realtime = env.REALTIME_URL ? null : await readSysConfig(db, 'realtime_url');
         const response = Response.json({ settings, servers, realtime_url: env.REALTIME_URL || realtime?.val || '' }, { headers: { 'Cache-Control': 'public, max-age=15, s-maxage=15' } });
         if (settings.is_public === 'true') context.waitUntil(caches.default.put(cacheKey, response.clone()));
         return response;
@@ -762,6 +888,7 @@ async function handleProbeAPI(request, env, context, pathArray) {
             if (!realtimeFrequencyPolicy(frequencySettings)) return Response.json({ error: 'Invalid realtime frequency policy' }, { status: 400 });
         }
         for (const [k, v] of Object.entries(settings)) { await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run(); }
+        invalidateReadCache('probe_setting'); invalidateReadCache('probe_settings');
         if (Object.prototype.hasOwnProperty.call(settings, 'is_public')) await notifyRealtimePublicPolicy(env, db, settings.is_public === 'true', url.origin).catch(() => {});
         if (frequencyKeys.some(key => Object.prototype.hasOwnProperty.call(settings, key))) await notifyRealtimeFrequencyPolicy(env, db, frequencySettings, url.origin).catch(() => {});
         if (settings.tg_bot_token) {
@@ -852,7 +979,7 @@ async function proxyLocal(method, subPath, req, env, body = null) {
                 }
                 const rawCountry = (slotMap["0"] || slotMap.country || "JP").toString().toUpperCase();
                 const proxyCfg = { enabled: slotMap.enabled !== false, port: slotMap.port || 7920, user: proxyUser, pass: proxyPass, country: rawCountry };
-                const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
+                const realtime = await readSysConfig(db, 'realtime_url');
                 return new Response(JSON.stringify({ ...slotMap, "0": rawCountry, "port": slotMap.port || 7920, "country": rawCountry, switch_trigger: slotMap.switch_trigger || 0, proxy: proxyCfg, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' }), { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0' } });
             } catch (e) { return new Response(JSON.stringify({ success: false, error: "GET config failed: " + e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } }); }
         }
@@ -1015,8 +1142,14 @@ export async function onRequest(context) {
     if (action === "ui_ping" && method === "POST") {
         if (!(await verifyAuth(request.headers.get("Authorization"), request, db, env, context))) return new Response("Unauthorized", { status: 401 });
         const now = Date.now();
-        const current = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first();
-        if (!current || now - current.ts > 45000) await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ui_active', '1', ?)").bind(now).run();
+        // ui_active 是纯心跳标记，缓存 15s 即可，避免每个心跳都打一次 D1
+        const current = await cachedRead('sys_config:ui_active', 15000, async () => {
+            return await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first() || null;
+        }, { negativeTtlMs: 5000 });
+        if (!current || now - current.ts > 45000) {
+            await db.prepare("INSERT OR REPLACE INTO sys_config (key, val, ts) VALUES ('ui_active', '1', ?)").bind(now).run();
+            D1_READ_CACHE.set('sys_config:ui_active', { value: { ts: now }, exp: Date.now() + 15000 });
+        }
         return Response.json({ success: true });
     }
 
@@ -1115,7 +1248,7 @@ export async function onRequest(context) {
                 reset_month = probeServer.reset_month || currentCycleStr;
                 
                 let autoReset = 'false';
-                try { const r = await db.prepare("SELECT value FROM probe_settings WHERE key = 'auto_reset_traffic'").first(); if (r) autoReset = r.value; } catch(e){}
+                try { const autoResetValue = await readProbeSetting(db, 'auto_reset_traffic', 300000); if (autoResetValue) autoReset = autoResetValue; } catch(e){}
                 // 周期变动立即清零结算
                 if (autoReset === 'true' && currentCycleStr !== reset_month) { monthly_rx = 0; monthly_tx = 0; reset_month = currentCycleStr; }
                 try { history = JSON.parse(probeServer.history || '{}'); } catch(e) {}
@@ -1164,29 +1297,43 @@ export async function onRequest(context) {
         if (stmts.length > 0) {
             await db.batch(stmts);
         }
-        if (nowMs - lastReceiptCleanup > 3600000) {
+        // 清理降频到 6 小时一次（配合 idx_receipts_created_at 索引，不再全表扫描）
+        if (nowMs - lastReceiptCleanup > 6 * 3600000) {
             lastReceiptCleanup = nowMs;
             context.waitUntil(db.prepare("DELETE FROM report_receipts WHERE created_at < ?").bind(nowMs - 604800000).run().catch(() => {}));
         }
+        // traffic_stats 无上限增长会撑爆 5GB 免费存储，按 30 天滚动清理
+        if (nowMs - lastStatsCleanup > 24 * 3600000) {
+            lastStatsCleanup = nowMs;
+            context.waitUntil(db.prepare("DELETE FROM traffic_stats WHERE timestamp < ?").bind(nowMs - 30 * 86400000).run().catch(() => {}));
+        }
         
-        let fastMode = false; try { const uiActive = await db.prepare("SELECT ts FROM sys_config WHERE key = 'ui_active'").first(); if (uiActive && (nowMs - uiActive.ts < 90000)) fastMode = true; } catch(e) {}
+        let fastMode = false;
+        try { const uiActive = await readSysConfig(db, 'ui_active', 15000); if (uiActive && (nowMs - Number(uiActive.ts || 0) < 90000)) fastMode = true; } catch(e) {}
         
         let reportInterval = 5; let pingCt = 'default'; let pingCu = 'default'; let pingCm = 'default';
         try { 
-            const { results } = await db.prepare("SELECT key, value FROM probe_settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm')").all(); 
-            if (results) {
-                results.forEach(r => {
-                    if (r.key === 'report_interval') reportInterval = parseInt(r.value) || 5;
-                    if (r.key === 'ping_node_ct') pingCt = r.value;
-                    if (r.key === 'ping_node_cu') pingCu = r.value;
-                    if (r.key === 'ping_node_cm') pingCm = r.value;
-                });
-            }
+            // 每 30 秒缓存一次：这 4 个设置变更极低频，却跟着每次上报读一遍
+            const results = await cachedRead('probe_settings:report_cfg', 30000, async () => {
+                const { results } = await db.prepare("SELECT key, value FROM probe_settings WHERE key IN ('report_interval', 'ping_node_ct', 'ping_node_cu', 'ping_node_cm')").all();
+                return results || [];
+            });
+            results.forEach(r => {
+                if (r.key === 'report_interval') reportInterval = parseInt(r.value) || 5;
+                if (r.key === 'ping_node_ct') pingCt = r.value;
+                if (r.key === 'ping_node_cu') pingCu = r.value;
+                if (r.key === 'ping_node_cm') pingCm = r.value;
+            });
         } catch(e) {}
         
         const effectiveInterval = Math.min(300, fastMode ? Math.max(15, reportInterval) : Math.max(90, reportInterval));
         return Response.json({ success: true, fast_mode: fastMode, interval: effectiveInterval, ping_ct: pingCt, ping_cu: pingCu, ping_cm: pingCm });
      } catch (err) {
+        if (isD1QuotaError(err)) {
+            // 额度耗尽时给出明确信号，避免被当作普通 500 反复重试
+            openD1Breaker(err);
+            return Response.json({ success: false, error: "D1_QUOTA_EXCEEDED", interval: 1800, fast_mode: false }, { status: 503 });
+        }
         return Response.json({ error: "REPORT_ERR: " + (err && err.message ? err.message : String(err)) }, { status: 500 });
      }
     }
@@ -1199,7 +1346,12 @@ export async function onRequest(context) {
         const agentAuthenticated = await verifyAgent(authHeader, ip, db, env);
         if (currentUser !== adminUser && !agentAuthenticated) return new Response("Unauthorized", { status: 401 });
         const query = `SELECT n.* FROM nodes n LEFT JOIN users u ON n.username = u.username WHERE n.vps_ip = ? AND n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND (n.username = ? OR n.username = 'admin' OR (u.username IS NOT NULL AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)))`;
-        const { results: machineNodes } = await db.prepare(query).bind(ip, now, adminUser, now).all();
+        // agent 每 30s 拉一次配置，节点列表变化极低频：缓存 10s，
+        // 配合 idx_nodes_vps_ip 把这里的读取量再降一个数量级
+        const machineNodes = await cachedRead(`nodes_cfg:${ip}`, 10000, async () => {
+            const { results } = await db.prepare(query).bind(ip, Date.now(), adminUser, Date.now()).all();
+            return results || [];
+        }, { negativeTtlMs: 5000, staleIfError: true });
         for (let node of machineNodes) { if (node.protocol === "dokodemo-door" && node.relay_type === "internal") { const targetNode = await db.prepare("SELECT * FROM nodes WHERE id = ?").bind(node.target_id).first(); if (targetNode) node.chain_target = { ip: targetNode.vps_ip, port: targetNode.port, protocol: targetNode.protocol, uuid: targetNode.uuid, password: targetNode.private_key, sni: targetNode.sni, public_key: targetNode.public_key, short_id: targetNode.short_id }; } }
         let proxyCfg = { global: {}, toggle: { enable: false } };
         try {
@@ -1222,7 +1374,7 @@ export async function onRequest(context) {
             residential_outbound = { available: localResidential && !!(env.PROXY_USER && env.PROXY_PASS), reason: localResidential ? '' : '外部住宅控制器模式未在本机安装 proxy-lite', addr: '127.0.0.1', port, user: agentAuthenticated && localResidential ? env.PROXY_USER || '' : '', pass: agentAuthenticated && localResidential ? env.PROXY_PASS || '' : '' };
         } catch (ex) {}
         const serverAuth = await db.prepare("SELECT agent_token FROM servers WHERE ip = ?").bind(ip).first();
-        const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
+        const realtime = await readSysConfig(db, 'realtime_url');
         return Response.json({ success: true, configs: machineNodes, agent_token: serverAuth && serverAuth.agent_token || '', proxy: proxyCfg, residential_outbound, egress, realtime_url: env.REALTIME_URL || realtime && realtime.val || '' });
     }
 
@@ -1596,7 +1748,7 @@ rules:
                 } catch(e){}
             }
             else { const u = await db.prepare("SELECT sub_token FROM users WHERE username = ?").bind(currentUser).first(); if(u && u.sub_token) mySubToken = u.sub_token; }
-            const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
+            const realtime = await readSysConfig(db, 'realtime_url');
             return Response.json({ servers, nodes, users, siteTitle, mySubToken, realtimeUrl: env.REALTIME_URL || realtime && realtime.val || '' });
         }
         
@@ -1629,15 +1781,15 @@ rules:
             if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: 'IP required' }, { status: 400 }); if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 }); const modes = ['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']; if (!modes.includes(data.egress_mode)) return Response.json({ error: 'Invalid egress mode' }, { status: 400 }); if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 }); if (data.egress_mode === 'residential' && (!env.PROXY_USER || !env.PROXY_PASS)) return Response.json({ error: 'Pages 未配置住宅代理凭据' }, { status: 503 }); const proxyMode = data.proxy_mode === 'selective' ? 'selective' : 'global'; const proxyCategories = data.proxy_categories ? String(data.proxy_categories) : ''; const socks5Addr = String(data.socks5_addr || '').slice(0, 128); const socks5Port = Math.min(65535, Math.max(1, Number(data.socks5_port) || 0)); const socks5User = String(data.socks5_user || '').slice(0, 64); const socks5Pass = String(data.socks5_pass || '').slice(0, 128); let changed; if (data.egress_mode === 'socks5' && socks5Addr && socks5Port) { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, socks5Addr, socks5Port, socks5User, socks5Pass, ip).first(); } else { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, ip).first(); } if (!changed) return Response.json({ error: 'VPS not found' }, { status: 404 }); context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {})); return Response.json({ success: true, ip, egress_mode: data.egress_mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, socks5_addr: data.egress_mode === 'socks5' ? socks5Addr : '', socks5_port: data.egress_mode === 'socks5' ? socks5Port : 0 }); }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
-                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]);
+                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]); invalidateReadCache('nodes_cfg:'); invalidateReadCache('agent_token:');
                 return Response.json({ success: true }); 
             }
         }
 
         if (action === "nodes" && isAdmin) {
-            if (method === "POST") { const n = await request.json(); const protocols = ['VLESS','XTLS-Reality','Reality','Hysteria2','TUIC','Trojan','H2-Reality','gRPC-Reality','AnyTLS','Naive','Socks5','VLESS-Argo','dokodemo-door']; if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(n.id || ''))) return Response.json({ error: 'Invalid node id' }, { status: 400 }); if (!protocols.includes(n.protocol)) return Response.json({ error: 'Invalid protocol' }, { status: 400 }); if (!Number.isInteger(Number(n.port)) || Number(n.port) < 1 || Number(n.port) > 65535) return Response.json({ error: 'Invalid port' }, { status: 400 }); if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(n.vps_ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 }); if (n.protocol === 'dokodemo-door') { if (!['internal','external'].includes(n.relay_type)) return Response.json({error:'Invalid relay type'},{status:400}); if (n.relay_type === 'external' && (!String(n.target_ip||'').trim() || !Number.isInteger(Number(n.target_port)) || Number(n.target_port)<1 || Number(n.target_port)>65535)) return Response.json({error:'Invalid relay target'},{status:400}); if (n.relay_type === 'internal' && !(await db.prepare('SELECT id FROM nodes WHERE id = ? AND vps_ip = ?').bind(n.target_id,n.vps_ip).first())) return Response.json({error:'Internal relay target not found on VPS'},{status:400}); } if (await db.prepare("SELECT id FROM nodes WHERE id = ?").bind(n.id).first()) return Response.json({ error: "Node already exists" }, { status: 409 }); let nodeUser = n.username || currentUser; if (nodeUser === 'admin') nodeUser = currentUser; await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username, network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(n.id, n.uuid, n.vps_ip, n.protocol, Number(n.port), n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, Math.max(0, Number(n.traffic_limit)||0), Math.max(0, Number(n.expire_time)||0), nodeUser, n.network||'tcp').run(); context.waitUntil(notifyRealtimeVps(env, db, n.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
-            if (method === "PUT") { const { id, enable, reset_traffic } = await request.json(); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); if (!node) return Response.json({ error: 'Node not found' }, { status: 404 }); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE nodes SET traffic_used = 0 WHERE id = ?").bind(id)); if (enable !== undefined) statements.push(db.prepare("UPDATE nodes SET enable = ? WHERE id = ?").bind(enable ? 1 : 0, id)); if (statements.length) await db.batch(statements); context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
-            if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); await db.prepare("DELETE FROM nodes WHERE id = ?").bind(id).run(); if (node) context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
+            if (method === "POST") { const n = await request.json(); const protocols = ['VLESS','XTLS-Reality','Reality','Hysteria2','TUIC','Trojan','H2-Reality','gRPC-Reality','AnyTLS','Naive','Socks5','VLESS-Argo','dokodemo-door']; if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(n.id || ''))) return Response.json({ error: 'Invalid node id' }, { status: 400 }); if (!protocols.includes(n.protocol)) return Response.json({ error: 'Invalid protocol' }, { status: 400 }); if (!Number.isInteger(Number(n.port)) || Number(n.port) < 1 || Number(n.port) > 65535) return Response.json({ error: 'Invalid port' }, { status: 400 }); if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(n.vps_ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 }); if (n.protocol === 'dokodemo-door') { if (!['internal','external'].includes(n.relay_type)) return Response.json({error:'Invalid relay type'},{status:400}); if (n.relay_type === 'external' && (!String(n.target_ip||'').trim() || !Number.isInteger(Number(n.target_port)) || Number(n.target_port)<1 || Number(n.target_port)>65535)) return Response.json({error:'Invalid relay target'},{status:400}); if (n.relay_type === 'internal' && !(await db.prepare('SELECT id FROM nodes WHERE id = ? AND vps_ip = ?').bind(n.target_id,n.vps_ip).first())) return Response.json({error:'Internal relay target not found on VPS'},{status:400}); } if (await db.prepare("SELECT id FROM nodes WHERE id = ?").bind(n.id).first()) return Response.json({ error: "Node already exists" }, { status: 409 }); let nodeUser = n.username || currentUser; if (nodeUser === 'admin') nodeUser = currentUser; await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username, network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(n.id, n.uuid, n.vps_ip, n.protocol, Number(n.port), n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, Math.max(0, Number(n.traffic_limit)||0), Math.max(0, Number(n.expire_time)||0), nodeUser, n.network||'tcp').run(); invalidateReadCache('nodes_cfg:'); context.waitUntil(notifyRealtimeVps(env, db, n.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
+            if (method === "PUT") { const { id, enable, reset_traffic } = await request.json(); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); if (!node) return Response.json({ error: 'Node not found' }, { status: 404 }); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE nodes SET traffic_used = 0 WHERE id = ?").bind(id)); if (enable !== undefined) statements.push(db.prepare("UPDATE nodes SET enable = ? WHERE id = ?").bind(enable ? 1 : 0, id)); if (statements.length) await db.batch(statements); invalidateReadCache('nodes_cfg:'); context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
+            if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); await db.prepare("DELETE FROM nodes WHERE id = ?").bind(id).run(); invalidateReadCache('nodes_cfg:'); if (node) context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
         }
 
     if (action === "thirdparty" && isAdmin) {
